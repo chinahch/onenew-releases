@@ -46,6 +46,17 @@ test('broken script asset cannot be returned as a successful installer', async (
   f.env.ASSETS.fetch = async () => new Response('<html>missing</html>');
   assert.equal((await f.request('/install')).status, 502);
 });
+test('Windows checkout CRLF is normalized before serving Bash', async () => {
+  const f=fixture();
+  f.env.ASSETS.fetch=async()=>new Response('#!/usr/bin/env bash\r\nset -eu\r\necho ok\r\n');
+  for(const path of ['/install','/upgrade']) {
+    const result=await f.request(path);
+    assert.equal(result.status,200);
+    const text=await result.text();
+    assert.equal(text.includes('\r'),false);
+    assert.match(text,/^#!\/usr\/bin\/env bash\n/);
+  }
+});
 test('HTTP 200 HTML or invalid binary is not returned as a release', async () => {
   for (const response of [new Response('<html>error</html>',{headers:{'Content-Type':'text/html'}}), new Response('error',{headers:{'Content-Type':'application/octet-stream'}})]) {
     const f=fixture(response);
