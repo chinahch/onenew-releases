@@ -1,0 +1,60 @@
+name: Verify distribution and import native release
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --test test/worker.test.mjs
+      - run: bash -n assets/install.sh
+      - name: Verify HTTPS distribution base
+        run: grep -Fxq 'BASE="https://get.timi.baby/releases/$RELEASE"' assets/install.sh
+  import:
+    needs: verify
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Import exact already-published native artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          existing=0
+          base=https://github.com/chinahch/onenew/releases/download/node-v0.1.10
+          if gh release view node-v0.1.10 >/dev/null 2>&1; then
+            existing=1
+            base="https://github.com/$GH_REPO/releases/download/node-v0.1.10"
+          fi
+          mkdir dist
+          cd dist
+          for file in onenew-node-linux-amd64.tar.gz onenew-node-linux-arm64.tar.gz SHA256SUMS-amd64 SHA256SUMS-arm64 build-info-amd64.json build-info-arm64.json; do
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$base/$file" -o "$file"
+          done
+          cat > pinned.sha256 <<'SUMS'
+          ee671949f42fec212814636189665420752260823cb06a8aaa0712c4f5875109  onenew-node-linux-amd64.tar.gz
+          2718d9f4711f411541e3eaf3003af016d30dd8d099a7edd33d4d4e8dd648597d  onenew-node-linux-arm64.tar.gz
+          0ca7c14e06defdbd517f8cd049a7b1c6c8b4e927a9edf6ceb1fbe63bdbc696db  SHA256SUMS-amd64
+          c70a1869483c550d2c10447f95019c76e46bf79be135b1ebd6538a32fc989a63  SHA256SUMS-arm64
+          1ce4a88e79d088d711e052c7d8f24babeda6e3756ea33b576777eb339df00a9d  build-info-amd64.json
+          16ed644e7cd9488c28397ece95507736cb5b736b39b9b5ee657e19ae2a410771  build-info-arm64.json
+          SUMS
+          sha256sum -c pinned.sha256
+          sha256sum -c SHA256SUMS-amd64
+          sha256sum -c SHA256SUMS-arm64
+          if [ "$existing" -eq 1 ]; then
+            echo 'Existing release assets verified; no assets replaced.'
+            exit 0
+          fi
+          gh release create node-v0.1.10 onenew-node-linux-*.tar.gz SHA256SUMS-* build-info-*.json --target "$GITHUB_SHA" --title 'Onenew native node v0.1.10' --prerelease --notes 'Exact SHA256-verified mirror of the existing native release; binaries are unchanged. Runtime service and process remain caddy. Installer compatibility fixes are maintained separately in assets/install.sh. Build sources and notices: https://github.com/chinahch/onenew/tree/c8b2ed6f34ed876b5ef2bfead3adc943d6b17995 and its pinned upstream build dependencies. Source privacy migration has not yet been enabled.'
