@@ -52,7 +52,8 @@ export function createHandler(upstream = fetch) {
       if (['/install','/upgrade'].includes(url.pathname)) {
         const asset = await env.ASSETS.fetch(new Request('https://assets.local/install.sh'));
         if (!asset.ok) return error(502, 'Installer unavailable');
-        let script = await asset.text();
+        // Windows Git checkouts may use CRLF; Bash delivery must always use LF.
+        let script = (await asset.text()).replace(/\r\n/g, '\n');
         if (!script.startsWith('#!/usr/bin/env bash\n')) return error(502, 'Invalid installer asset');
         if (url.pathname === '/upgrade') script = script.replace('\n', '\nset -- --upgrade "$@"\n');
         return new Response(head ? null : script, {headers:HEADERS});
