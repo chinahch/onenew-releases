@@ -12,9 +12,9 @@ onenew_download_source() {
     [ -f "$token_file" ] && [ ! -L "$token_file" ] || { echo 'GitHub credential must be a regular private file.' >&2; return 1; }
     mode=$(stat -c '%a' "$token_file") || return 1
     { [ "$mode" = 600 ] || [ "$mode" = 400 ]; } && [ "$(stat -c '%u' "$token_file")" = "$(id -u)" ] || { echo 'GitHub credential must belong to the current user with mode 600 or 400.' >&2; return 1; }
-    [ "$(wc -c < "$token_file")" -le 512 ] || return 1
+    [ "$(wc -c < "$token_file")" -le 16384 ] || return 1
     token=$(cat -- "$token_file")
-    [[ ${#token} -ge 16 && ${#token} -le 256 && "$token" != *[!A-Za-z0-9_]* ]] || { echo 'Invalid GitHub credential file.' >&2; return 1; }
+    [[ ${#token} -ge 16 && ${#token} -le 16384 && "$token" != *[!A-Za-z0-9_.-]* ]] || { echo 'Invalid GitHub credential file.' >&2; return 1; }
     config=$(mktemp "$stage/onenew-auth.XXXXXXXX.curl") || return 1
     chmod 600 "$config"
     printf 'user = "x-access-token:%s"\n' "$token" > "$config"
