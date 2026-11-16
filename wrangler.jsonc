@@ -1,0 +1,10 @@
+{
+  "name": "onenew-get",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{"pattern":"get.timi.baby", "custom_domain":true}],
+  "assets": {"directory":"./assets", "binding":"ASSETS", "run_worker_first":true},
+  "observability": {"enabled":false}
+}
