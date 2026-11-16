@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {spawnSync} from 'node:child_process';
 import { createHandler } from '../worker.mjs';
 
 const origin = 'https://get.timi.baby';
 function fixture(reply = new Response(new Uint8Array([31,139,8,0]))) {
   const calls = [];
-  const handler = createHandler(async (url, init) => { calls.push({url, init}); return reply; });
+  const handler = createHandler(async (url, init) => { calls.push({url, init}); return reply; },(name,env)=>env.ASSETS.fetch(new Request('https://assets.local/'+name)));
   const env = {ASSETS: {fetch: async () => new Response('#!/usr/bin/env bash\necho fixture\n')}};
   return {calls, env, request: (path, init) => handler(new Request(origin + path, init), env)};
 }
@@ -25,6 +29,14 @@ test('only explicit release assets are proxied without incoming credentials', as
   assert.equal(f.calls[0].url, 'https://github.com/chinahch/onenew-releases/releases/download/node-v0.1.10/onenew-node-linux-amd64.tar.gz');
   assert.equal(JSON.stringify(f.calls).includes('private'), false);
   assert.equal(result.headers.get('location'), null);
+});
+test('short entry downloads complete installer and checks hash before privileged execution',async()=>{
+ const f=fixture();const text=await(await f.request('/install')).text();
+ assert.match(text,/https:\/\/get\.timi\.baby\/node\/install\.sh/);
+ assert.ok(text.indexOf('sha256sum -c')<text.indexOf('sudo -n bash'));
+ assert.match(text,/sudo -v <\/dev\/tty/);
+ const full=await(await f.request('/node/install.sh')).text();
+ assert.equal(full,'#!/usr/bin/env bash\necho fixture\n');
 });
 test('unknown paths, query strings and non-GET methods never reach upstream', async () => {
   const f = fixture();
@@ -67,4 +79,35 @@ test('checksum contents must name the expected architecture artifact', async () 
   const valid='a'.repeat(64)+'  onenew-node-linux-amd64.tar.gz\n';
   assert.equal((await fixture(new Response(valid)).request('/releases/node-v0.1.10/SHA256SUMS-amd64')).status,200);
   assert.equal((await fixture(new Response(valid.replace('amd64','arm64'))).request('/releases/node-v0.1.10/SHA256SUMS-amd64')).status,502);
+});
+test('panel scripts have separate fixed raw routes and do not receive node upgrade flag',async()=>{
+ const f=fixture();
+ for(const name of ['upgrade','restore']) {
+  const text=await(await f.request('/panel/'+name)).text();
+  assert.ok(text.includes('https://get.timi.baby/scripts/panel-'+name+'.sh'));
+  assert.ok(!text.includes('set -- --upgrade'));
+  assert.equal((await f.request('/scripts/panel-'+name+'.sh')).status,200);
+ }
+ assert.equal((await f.request('/scripts/private-source.tar.gz')).status,404);
+});
+test('actual bootstrap preserves token stdin and refuses a corrupted installer before execution',async()=>{
+ const temp=fs.mkdtempSync(path.join(os.tmpdir(),'onenew-bootstrap-'));
+ const installer='#!/usr/bin/env bash\nIFS= read -r token\n[ "$token" = fixture-token ] || exit 55\nprintf ran > "$TEST_MARKER"\n';
+ const f=fixture();f.env.ASSETS.fetch=async()=>new Response(installer);
+ fs.mkdirSync(path.join(temp,'bin'));
+ fs.writeFileSync(path.join(temp,'bootstrap.sh'),await(await f.request('/install')).text());
+ fs.writeFileSync(path.join(temp,'installer.sh'),installer);
+ fs.writeFileSync(path.join(temp,'bin','id'),'#!/bin/sh\necho 0\n',{mode:0o755});
+ fs.writeFileSync(path.join(temp,'bin','curl'),'#!/bin/bash\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then out=$2;shift 2;else shift;fi;done\nif [ "$CORRUPT" = 1 ]; then printf corrupt > "$out";else cp "$FIXTURE_INSTALLER" "$out";fi\n',{mode:0o755});
+ const posix=p=>process.platform==='win32'?'/'+p[0].toLowerCase()+p.slice(2).replaceAll('\\','/'):p;
+ try {
+  for(const corrupt of ['1','0']) {
+   const result=spawnSync(process.platform==='win32'?'C:/Program Files/Git/bin/bash.exe':'bash',['-c','export PATH="$MOCK_BIN:$PATH"; exec bash "$BOOTSTRAP"'],{input:'fixture-token\n',encoding:'utf8',env:{...process.env,MOCK_BIN:posix(path.join(temp,'bin')),BOOTSTRAP:path.join(temp,'bootstrap.sh').replaceAll('\\','/'),FIXTURE_INSTALLER:path.join(temp,'installer.sh').replaceAll('\\','/'),TEST_MARKER:path.join(temp,'marker').replaceAll('\\','/'),CORRUPT:corrupt}});
+   if(corrupt==='1'){assert.notEqual(result.status,0);assert.equal(fs.existsSync(path.join(temp,'marker')),false)}
+   else{assert.equal(result.status,0,result.stderr);assert.equal(fs.readFileSync(path.join(temp,'marker'),'utf8'),'ran')}
+  }
+ } finally {
+  assert.ok(path.resolve(temp).startsWith(path.resolve(os.tmpdir())+path.sep));
+  fs.rmSync(temp,{recursive:true,force:true});
+ }
 });

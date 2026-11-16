@@ -41,7 +41,7 @@ async function artifactBody(response, filename) {
 }
 
 // Fixed destinations only. No client-supplied origin, credentials or request headers.
-export function createHandler(upstream = fetch) {
+export function createHandler(upstream = fetch, scriptLoader = null) {
   return async function handle(request, env) {
     const url = new URL(request.url);
     if (request.method !== 'GET' && request.method !== 'HEAD') return error(405, 'GET or HEAD required');
@@ -49,13 +49,40 @@ export function createHandler(upstream = fetch) {
     const head = request.method === 'HEAD';
     try {
       if (url.pathname === '/health') return new Response(head ? null : 'onenew distribution ready\n', {headers:HEADERS});
-      if (['/install','/upgrade'].includes(url.pathname)) {
-        const asset = await env.ASSETS.fetch(new Request('https://assets.local/install.sh'));
+      const scriptAssets = {
+        '/install':['install.sh','/node/install.sh'], '/upgrade':['install.sh','/node/install.sh'], '/node/install.sh':['install.sh',null],
+        '/panel/upgrade':['panel-upgrade.sh','/scripts/panel-upgrade.sh'], '/scripts/panel-upgrade.sh':['panel-upgrade.sh',null],
+        '/panel/restore':['panel-restore.sh','/scripts/panel-restore.sh'], '/scripts/panel-restore.sh':['panel-restore.sh',null]
+      };
+      if (Object.hasOwn(scriptAssets,url.pathname)) {
+        const [name,rawPath]=scriptAssets[url.pathname];
+        // Public scripts are independent of private panel source. Fetch the latest
+        // published copy so node upgrades do not require another Worker deployment.
+        const asset = scriptLoader ? await scriptLoader(name,env) : await upstream(
+          'https://raw.githubusercontent.com/'+REPOSITORY+'/main/assets/'+name,
+          {headers:{'User-Agent':'onenew-distribution'},signal:AbortSignal.timeout(15000),cf:{cacheTtl:60}}
+        );
         if (!asset.ok) return error(502, 'Installer unavailable');
         // Windows Git checkouts may use CRLF; Bash delivery must always use LF.
         let script = (await asset.text()).replace(/\r\n/g, '\n');
         if (!script.startsWith('#!/usr/bin/env bash\n')) return error(502, 'Invalid installer asset');
-        if (url.pathname === '/upgrade') script = script.replace('\n', '\nset -- --upgrade "$@"\n');
+        if (rawPath) {
+          const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(script))),b=>b.toString(16).padStart(2,'0')).join('');
+          script=`#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+${url.pathname==='/upgrade'?'set -- --upgrade "$@"\n':''}f=$(mktemp) || exit
+trap 'rm -f -- "$f"' EXIT
+curl --proto '=https' --tlsv1.2 -fsSL https://get.timi.baby${rawPath} -o "$f"
+printf '%s  %s\\n' '${hash}' "$f" | sha256sum -c - >/dev/null
+if [ "$(id -u)" = 0 ]; then
+  bash "$f" "$@"
+else
+  sudo -v </dev/tty
+  sudo -n bash "$f" "$@"
+fi
+`;
+        }
         return new Response(head ? null : script, {headers:HEADERS});
       }
       const match = /^\/releases\/(node-v\d+\.\d+\.\d+)\/(onenew-node-linux-(?:amd64|arm64)\.tar\.gz|SHA256SUMS-(?:amd64|arm64)|build-info-(?:amd64|arm64)\.json)$/.exec(url.pathname);
