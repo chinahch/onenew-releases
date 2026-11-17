@@ -2,8 +2,8 @@
 # Native binary installation; no Docker is used on the node server.
 set -Eeuo pipefail
 umask 077
-VERSION=onenew-v0.1.11
-RELEASE=node-v0.1.11
+VERSION=onenew-v0.1.12
+RELEASE=node-v0.1.12
 BASE="https://get.timi.baby/releases/$RELEASE"
 ROOT=/etc/caddy
 PANEL= TOKEN= MACHINE= CHECK=0 UPGRADE=0
@@ -20,9 +20,15 @@ while [ "$#" -gt 0 ]; do
     *) fail 'Unknown installation argument' ;;
   esac
 done
-[[ "$PANEL" =~ ^https://[^/@[:space:]\?#]+(:[0-9]+)?(/[^[:space:]\?#]*)?$ ]] || fail 'A valid HTTPS panel URL is required'
-[[ "$MACHINE" =~ ^[1-9][0-9]*$ ]] || fail 'A positive machine ID is required'
-[ -n "$TOKEN" ] || fail 'A machine token is required'
+# Supplied bindings are validated before network activity; a bare upgrade
+# resolves missing values with the verified helper, never shell-sources files.
+if [ -n "$PANEL" ] || [ "$UPGRADE" -eq 0 ]; then
+  [[ "$PANEL" =~ ^https://[^/@[:space:]\?#]+(:[0-9]+)?(/[^[:space:]\?#]*)?$ ]] || fail 'A valid HTTPS panel URL is required'
+fi
+if [ -n "$MACHINE" ] || [ "$UPGRADE" -eq 0 ]; then
+  [[ "$MACHINE" =~ ^[1-9][0-9]*$ ]] || fail 'A positive machine ID is required'
+fi
+[ -n "$TOKEN" ] || [ "$UPGRADE" -eq 1 ] || fail 'A machine token is required'
 [ "$(id -u)" -eq 0 ] || [ "$CHECK" -eq 1 ] || fail 'Run as root or sudo'
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
@@ -34,7 +40,8 @@ if [ "$CHECK" -eq 0 ] && [ "$UPGRADE" -eq 0 ]; then
   for path in "$ROOT" /etc/php-fpm/config.yml /etc/xboard-node/config.yml \
     /etc/systemd/system/caddy.service /lib/systemd/system/caddy.service \
     /usr/lib/systemd/system/caddy.service /etc/init.d/caddy \
-    /usr/local/bin/caddy /usr/local/bin/caddyctl; do
+    /usr/local/bin/caddy /usr/local/bin/caddyctl /usr/local/bin/caddy-updater \
+    /etc/systemd/system/caddy-updater.service /etc/init.d/caddy-updater; do
     { [ ! -e "$path" ] && [ ! -L "$path" ]; } || fail 'Existing caddy service, binary or node configuration found. Back it up and migrate the old service before installing; nothing was replaced.'
   done
   if command -v caddy >/dev/null 2>&1; then
@@ -63,6 +70,20 @@ if [ "$UPGRADE" -eq 1 ]; then
     [ -f "$path" ] && [ ! -L "$path" ] || fail 'Upgrade requires a complete native Onenew installation with regular files'
   done
   [ ! -L "$ROOT" ] || fail 'Upgrade refuses a symlinked configuration directory'
+  command -v flock >/dev/null || fail 'Missing dependency: flock (install util-linux)'
+  [ ! -L "$ROOT/updater.lock" ] || fail 'Assistant lock is a symlink'
+  exec 9>"$ROOT/updater.lock"
+  flock -n 9 || fail 'Upgrade assistant or another installer holds the upgrade lock'
+  LOCKED=1
+  # Once bootstrapped, panel upgrades are serialized by the assistant. Refuse
+  # concurrent manual replacement rather than interrupt an active transaction.
+  if [ -f /usr/local/bin/caddy-updater ]; then
+    if { [ "$MANAGER" = systemd ] && systemctl is-active --quiet caddy-updater.service; } ||
+       { [ "$MANAGER" = openrc ] && rc-service caddy-updater status >/dev/null 2>&1; }; then
+      fail 'Upgrade assistant is running; use the panel remote upgrade action'
+    fi
+    [ ! -e "$ROOT/updater/journal.json" ] || fail 'Assistant has a pending recovery/result journal; start it and resolve the task first'
+  fi
   for path in /etc/php-fpm/config.yml /etc/xboard-node/config.yml; do
     [ ! -e "$path" ] && [ ! -L "$path" ] || fail 'Conflicting node service found; upgrade refused'
   done
@@ -95,8 +116,76 @@ if [ "$UPGRADE" -eq 1 ]; then
   OLD_VERSION=$(/usr/local/bin/caddy -v 2>/dev/null) || fail 'Cannot identify installed native binary'
   [[ "$OLD_VERSION" == 'caddy onenew-v'*' (built '* ]] || fail 'Installed caddy is not an Onenew native node'
 fi
+# Assistant targets must never redirect writes outside the managed installation.
+for path in /usr/local/bin/caddy-updater /etc/systemd/system/caddy-updater.service /etc/init.d/caddy-updater; do
+  [ ! -L "$path" ] || fail 'Upgrade assistant target is a symlink'
+done
 STAGE=$(mktemp -d)
-trap 'rm -rf -- "$STAGE"' EXIT
+trap 'if [ "${LOCKED:-0}" -eq 1 ]; then flock -u 9 >/dev/null 2>&1 || true; fi; rm -rf -- "$STAGE"' EXIT
+UPDATER="caddy-updater-linux-$ARCH"
+curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/$UPDATER" -o "$STAGE/$UPDATER"
+curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/SHA256SUMS-updater-$ARCH" -o "$STAGE/updater-sums"
+SUM=$(awk -v file="$UPDATER" '$2 == file && $1 ~ /^[0-9a-f]+$/ && length($1) == 64 { print $1 }' "$STAGE/updater-sums")
+[[ "$SUM" =~ ^[0-9a-f]{64}$ ]] || fail 'Missing or ambiguous assistant checksum'
+(cd "$STAGE"; printf '%s  %s\n' "$SUM" "$UPDATER" | sha256sum -c - >/dev/null) || fail 'Assistant checksum mismatch; nothing was installed'
+chmod 755 "$STAGE/$UPDATER"
+if [ "$UPGRADE" -eq 1 ]; then
+  [ -n "$PANEL" ] || PANEL=$("$STAGE/$UPDATER" binding --root "$ROOT" --field panel) || fail 'Cannot resolve saved panel binding'
+  [ -n "$MACHINE" ] || MACHINE=$("$STAGE/$UPDATER" binding --root "$ROOT" --field machine) || fail 'Cannot resolve saved machine binding'
+  [ -n "$TOKEN" ] || TOKEN=$("$STAGE/$UPDATER" binding --root "$ROOT" --field token) || fail 'Cannot resolve saved machine credential'
+fi
+[[ "$PANEL" =~ ^https://[^/@[:space:]\?#]+(:[0-9]+)?(/[^[:space:]\?#]*)?$ ]] || fail 'A valid HTTPS panel URL is required'
+[[ "$MACHINE" =~ ^[1-9][0-9]*$ ]] || fail 'A positive machine ID is required'
+[ -n "$TOKEN" ] || fail 'A machine token is required'
+
+install_updater() {
+  # Core replacement and health/rollback have completed. Explicitly unlock
+  # before launching the daemon; OpenRC children may inherit descriptor 9.
+  if [ "${LOCKED:-0}" -eq 1 ]; then flock -u 9; exec 9>&-; LOCKED=0; fi
+  # Updating the helper is independent from caddy, and requires no credentials
+  # in service arguments or shell environment files.
+  local candidate
+  candidate=$(mktemp /usr/local/bin/.caddy-updater.XXXXXXXX)
+  install -m 755 "$STAGE/$UPDATER" "$candidate"
+  mv -f "$candidate" /usr/local/bin/caddy-updater
+  if [ "$MANAGER" = systemd ]; then
+    cat > /etc/systemd/system/caddy-updater.service <<'UNIT'
+[Unit]
+Description=Onenew Native Upgrade Assistant
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/caddy-updater run --root /etc/caddy --manager systemd
+Restart=always
+RestartSec=10
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable caddy-updater.service
+    systemctl restart caddy-updater.service
+    systemctl is-active --quiet caddy-updater.service || fail 'Upgrade assistant failed to start'
+  else
+    cat > /etc/init.d/caddy-updater <<'UNIT'
+#!/sbin/openrc-run
+description="Onenew Native Upgrade Assistant"
+command="/usr/local/bin/caddy-updater"
+command_args="run --root /etc/caddy --manager openrc"
+supervisor="supervise-daemon"
+respawn_delay=10
+respawn_max=0
+output_log="/var/log/caddy-updater.log"
+error_log="/var/log/caddy-updater.err"
+depend() { need net; }
+UNIT
+    chmod 755 /etc/init.d/caddy-updater
+    rc-update add caddy-updater default
+    rc-service caddy-updater restart
+    rc-service caddy-updater status >/dev/null || fail 'Upgrade assistant failed to start'
+  fi
+}
 PACKAGE="onenew-node-linux-$ARCH.tar.gz"
 curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/$PACKAGE" -o "$STAGE/$PACKAGE"
 curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/SHA256SUMS-$ARCH" -o "$STAGE/SHA256SUMS"
@@ -212,6 +301,7 @@ if [ "$UPGRADE" -eq 1 ]; then
       rm -rf -- "$old"
     fi
   done
+  install_updater
   printf 'Upgraded %s (%s); node configuration preserved and old installer backups cleaned.\n' "$VERSION" "$MANAGER"
   exit 0
 fi
@@ -287,4 +377,5 @@ UNIT
   done
   [ "$READY" -eq 1 ] || fail 'Node did not reach healthy machine state after install; inspect /var/log/caddy.err'
 fi
+install_updater
 printf 'Installed %s. Configuration: /etc/caddy. Management: caddyctl\n' "$VERSION"
