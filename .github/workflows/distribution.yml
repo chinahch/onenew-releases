@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - run: node --test test/worker.test.mjs
+      - run: node --test test/*.test.mjs
       - run: bash -n assets/install.sh
       - name: Verify HTTPS distribution base
         run: grep -Fxq 'BASE="https://get.timi.baby/releases/$RELEASE"' assets/install.sh
