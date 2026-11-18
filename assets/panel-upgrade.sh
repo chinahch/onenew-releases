@@ -76,4 +76,7 @@ cat "$work/env.compose.restore" > .env.compose.restore
 docker compose --project-name "$project" --env-file .env.compose.restore -f compose.yaml up -d --build --wait
 actual=$(docker compose --project-name "$project" --env-file .env.compose.restore -f compose.yaml exec -T onenew cat /opt/onenew/REVISION)
 [[ "$actual" == "$revision" ]] || { echo 'Running image version did not match; retain the code backup.' >&2; exit 1; }
+# Entrypoint may keep the web process alive after an update failure. Require the
+# pending database migrations to succeed before reporting an archive upgrade done.
+docker compose --project-name "$project" --env-file .env.compose.restore -f compose.yaml exec -T onenew php artisan migrate --force --no-interaction
 printf 'Version permanently pinned: %s\nNormal docker compose up -d --build now preserves it. Refresh the migration page.\n' "$revision"
