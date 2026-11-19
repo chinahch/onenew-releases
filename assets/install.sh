@@ -8,6 +8,25 @@ BASE="https://get.timi.baby/releases/$RELEASE"
 ROOT=/etc/caddy
 PANEL= TOKEN= MACHINE= CHECK=0 UPGRADE=0 REFRESH=0
 fail() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
+download_asset() {
+  local name="$1" destination="$2" attempt status
+  for attempt in 1 2 3; do
+    if curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 \
+      --max-time 300 --speed-limit 1024 --speed-time 30 \
+      --continue-at - "$BASE/$name" -o "$destination"; then
+      return 0
+    else
+      status=$?
+    fi
+    case "$status" in
+      33|36) rm -f -- "$destination" ;; # The origin did not honor the requested offset.
+      6|7|18|22|28|35|52|55|56) ;;
+      *) return "$status" ;;
+    esac
+    if [ "$attempt" -lt 3 ]; then sleep "$attempt"; fi
+  done
+  return "$status"
+}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --check-only) CHECK=1; shift ;;
@@ -131,8 +150,8 @@ done
 STAGE=$(mktemp -d)
 trap 'if [ "${LOCKED:-0}" -eq 1 ]; then flock -u 9 >/dev/null 2>&1 || true; fi; rm -rf -- "$STAGE"; if [ "$UPGRADE" -eq 1 ]; then flock -u 8 >/dev/null 2>&1 || true; exec 8>&-; fi' EXIT
 UPDATER="caddy-updater-linux-$ARCH"
-curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/$UPDATER" -o "$STAGE/$UPDATER"
-curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/SHA256SUMS-updater-$ARCH" -o "$STAGE/updater-sums"
+download_asset "$UPDATER" "$STAGE/$UPDATER"
+download_asset "SHA256SUMS-updater-$ARCH" "$STAGE/updater-sums"
 SUM=$(awk -v file="$UPDATER" '$2 == file && $1 ~ /^[0-9a-f]+$/ && length($1) == 64 { print $1 }' "$STAGE/updater-sums")
 [[ "$SUM" =~ ^[0-9a-f]{64}$ ]] || fail 'Missing or ambiguous assistant checksum'
 (cd "$STAGE"; printf '%s  %s\n' "$SUM" "$UPDATER" | sha256sum -c - >/dev/null) || fail 'Assistant checksum mismatch; nothing was installed'
@@ -284,8 +303,8 @@ if [ "$REFRESH" -eq 1 ]; then
   exit 0
 fi
 PACKAGE="onenew-node-linux-$ARCH.tar.gz"
-curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/$PACKAGE" -o "$STAGE/$PACKAGE"
-curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/SHA256SUMS-$ARCH" -o "$STAGE/SHA256SUMS"
+download_asset "$PACKAGE" "$STAGE/$PACKAGE"
+download_asset "SHA256SUMS-$ARCH" "$STAGE/SHA256SUMS"
 SUM=$(awk -v file="$PACKAGE" '$2 == file && $1 ~ /^[0-9a-f]+$/ && length($1) == 64 { print $1 }' "$STAGE/SHA256SUMS")
 [[ "$SUM" =~ ^[0-9a-f]{64}$ ]] || fail 'Missing or ambiguous package checksum'
 (cd "$STAGE"; printf '%s  %s\n' "$SUM" "$PACKAGE" | sha256sum -c - >/dev/null) || fail 'Package checksum mismatch; nothing was installed'
