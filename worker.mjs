@@ -13,7 +13,7 @@ async function boundedText(body, limit) {
   for(const chunk of chunks) { bytes.set(chunk,offset); offset+=chunk.length; }
   return new TextDecoder().decode(bytes);
 }
-async function artifactBody(response, filename) {
+async function artifactBody(response, filename, expectedLength, partial = false) {
   if (/html/i.test(response.headers.get('Content-Type') || '') || !response.body) {
     await response.body?.cancel(); throw new Error('Invalid artifact');
   }
@@ -32,12 +32,11 @@ async function artifactBody(response, filename) {
     return text;
   }
   const reader=response.body.getReader(); const initial=[]; let size=0;
-  const needed=executable?4:2;
+  const needed=partial?0:executable?4:2;
   while(size<needed) { const next=await reader.read(); if(next.done) break; initial.push(next.value); size+=next.value.length; }
   const prefix=initial.flatMap(chunk=>Array.from(chunk.subarray(0,needed))).slice(0,needed);
   const magic=executable?[127,69,76,70]:[31,139];
-  if(magic.some((byte,index)=>prefix[index]!==byte)) { await reader.cancel(); throw new Error('Invalid binary'); }
-  const expectedLength=Number(response.headers.get('Content-Length'))||0;
+  if(!partial && magic.some((byte,index)=>prefix[index]!==byte)) { await reader.cancel(); throw new Error('Invalid binary'); }
   return new ReadableStream({
     start(controller) { for(const chunk of initial) controller.enqueue(chunk); },
     async pull(controller) { const next=await reader.read(); if(next.done) { if(expectedLength && size!==expectedLength) controller.error(new Error('Truncated release asset')); else controller.close(); } else { size+=next.value.length; controller.enqueue(next.value); } },
@@ -92,20 +91,49 @@ fi
       }
       const match = /^\/releases\/(node-v\d+\.\d+\.\d+)\/(onenew-node-linux-(?:amd64|arm64)\.tar\.gz|onenew-node-source\.tar\.gz|caddy-updater-linux-(?:amd64|arm64)|SHA256SUMS-(?:(?:updater-)?(?:amd64|arm64)|source)|build-info-(?:amd64|arm64)\.json)$/.exec(url.pathname);
       if (!match) return error(404, 'Not found');
+      const binary = match[2].endsWith('.tar.gz') || match[2].startsWith('caddy-updater-linux-');
+      const range = binary && !head ? request.headers.get('Range') : null;
+      const bounds = range === null ? null : /^bytes=(\d{1,10})-(\d{0,10})$/.exec(range);
+      if (range !== null && (!bounds || (bounds[2] && Number(bounds[1]) > Number(bounds[2])))) {
+        return error(400, 'Expected one byte range with an explicit start');
+      }
+      const upstreamHeaders = {'User-Agent':'onenew-distribution'};
+      if (bounds) upstreamHeaders.Range = range;
       const response = await upstream(`https://github.com/${REPOSITORY}/releases/download/${match[1]}/${match[2]}`, {
         method:head ? 'HEAD' : 'GET', redirect:'follow', signal:AbortSignal.timeout(900000),
-        headers:{'User-Agent':'onenew-distribution'}
+        headers:upstreamHeaders
       });
-      if (response.status !== 200) { await response.body?.cancel(); return error(502, 'Release asset unavailable'); }
+      if (bounds && response.status === 416) {
+        await response.body?.cancel();
+        const headers = new Headers(HEADERS);
+        const contentRange = response.headers.get('Content-Range');
+        if (/^bytes \*\/\d{1,10}$/.test(contentRange||'')) headers.set('Content-Range',contentRange);
+        return new Response('Range not satisfiable\n',{status:416,headers});
+      }
+      const partial = Boolean(bounds && response.status === 206);
+      if (response.status !== 200 && !partial) { await response.body?.cancel(); return error(502, 'Release asset unavailable'); }
       const headers = new Headers({
         'Content-Type':match[2].endsWith('.tar.gz') ? 'application/gzip' : match[2].startsWith('caddy-updater-linux-') ? 'application/octet-stream' : 'text/plain; charset=utf-8',
         'X-Content-Type-Options':'nosniff', 'Cache-Control':'public, max-age=300'
       });
-      const length=response.headers.get('Content-Length');
-      if((match[2].endsWith('.tar.gz') || match[2].startsWith('caddy-updater-linux-')) && /^[1-9][0-9]*$/.test(length||'')) headers.set('Content-Length',length);
+      let length = Number(response.headers.get('Content-Length')) || 0;
+      if (partial) {
+        const contentRange = response.headers.get('Content-Range');
+        const parts = /^bytes (\d{1,10})-(\d{1,10})\/(\d{1,10})$/.exec(contentRange||'');
+        const [start,end,total] = parts ? parts.slice(1).map(Number) : [];
+        const expectedEnd = bounds[2] ? Math.min(Number(bounds[2]),total-1) : total-1;
+        if (!parts || start !== Number(bounds[1]) || end < start || end !== expectedEnd || (length && length !== end-start+1)) {
+          await response.body?.cancel();
+          return error(502, 'Invalid upstream byte range');
+        }
+        length = end-start+1;
+        headers.set('Content-Range',contentRange);
+        headers.set('Cache-Control','no-store');
+      }
+      if(binary && Number.isSafeInteger(length) && length>0) headers.set('Content-Length',String(length));
       // Never propagate Location, Set-Cookie, or arbitrary upstream headers.
-      const body=head ? null : await artifactBody(response,match[2]);
-      return new Response(body, {headers});
+      const body=head ? null : await artifactBody(response,match[2],length,partial);
+      return new Response(body, {status:partial?206:200,headers});
     } catch { return error(502, 'Distribution service unavailable'); }
   };
 }
