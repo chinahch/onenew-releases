@@ -2,16 +2,17 @@
 # Native binary installation; no Docker is used on the node server.
 set -Eeuo pipefail
 umask 077
-VERSION=onenew-v0.1.15
-RELEASE=node-v0.1.15
+VERSION=onenew-v0.1.16
+RELEASE=node-v0.1.16
 BASE="https://get.timi.baby/releases/$RELEASE"
 ROOT=/etc/caddy
-PANEL= TOKEN= MACHINE= CHECK=0 UPGRADE=0
+PANEL= TOKEN= MACHINE= CHECK=0 UPGRADE=0 REFRESH=0
 fail() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --check-only) CHECK=1; shift ;;
     --upgrade) UPGRADE=1; shift ;;
+    --refresh-assistant) REFRESH=1; UPGRADE=1; shift ;;
     --mode) [ "${2:-}" = machine ] || fail 'Only machine mode is supported'; shift 2 ;;
     --panel) [ "$#" -ge 2 ] || fail 'Missing panel'; PANEL="$2"; shift 2 ;;
     --token) [ "$#" -ge 2 ] || fail 'Missing token'; TOKEN="$2"; shift 2 ;;
@@ -71,7 +72,13 @@ if [ "$UPGRADE" -eq 1 ]; then
   done
   [ ! -L "$ROOT" ] || fail 'Upgrade refuses a symlinked configuration directory'
   command -v flock >/dev/null || fail 'Missing dependency: flock (install util-linux)'
+  [ ! -L "$ROOT/installer.lock" ] || fail 'Installer lock is a symlink'
+  { [ ! -e "$ROOT/installer.lock" ] || [ -f "$ROOT/installer.lock" ]; } || fail 'Installer lock is not a regular file'
+  exec 8>"$ROOT/installer.lock"
+  flock -n 8 || fail 'Another installer holds the installer lock'
+  trap 'flock -u 8 >/dev/null 2>&1 || true; exec 8>&-' EXIT
   [ ! -L "$ROOT/updater.lock" ] || fail 'Assistant lock is a symlink'
+  if [ "$REFRESH" -eq 0 ]; then
   exec 9>"$ROOT/updater.lock"
   flock -n 9 || fail 'Upgrade assistant or another installer holds the upgrade lock'
   LOCKED=1
@@ -83,6 +90,7 @@ if [ "$UPGRADE" -eq 1 ]; then
       fail 'Upgrade assistant is running; use the panel remote upgrade action'
     fi
     [ ! -e "$ROOT/updater/journal.json" ] || fail 'Assistant has a pending recovery/result journal; start it and resolve the task first'
+  fi
   fi
   for path in /etc/php-fpm/config.yml /etc/xboard-node/config.yml; do
     [ ! -e "$path" ] && [ ! -L "$path" ] || fail 'Conflicting node service found; upgrade refused'
@@ -121,7 +129,7 @@ for path in /usr/local/bin/caddy-updater /etc/systemd/system/caddy-updater.servi
   [ ! -L "$path" ] || fail 'Upgrade assistant target is a symlink'
 done
 STAGE=$(mktemp -d)
-trap 'if [ "${LOCKED:-0}" -eq 1 ]; then flock -u 9 >/dev/null 2>&1 || true; fi; rm -rf -- "$STAGE"' EXIT
+trap 'if [ "${LOCKED:-0}" -eq 1 ]; then flock -u 9 >/dev/null 2>&1 || true; fi; rm -rf -- "$STAGE"; if [ "$UPGRADE" -eq 1 ]; then flock -u 8 >/dev/null 2>&1 || true; exec 8>&-; fi' EXIT
 UPDATER="caddy-updater-linux-$ARCH"
 curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/$UPDATER" -o "$STAGE/$UPDATER"
 curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/SHA256SUMS-updater-$ARCH" -o "$STAGE/updater-sums"
@@ -129,19 +137,20 @@ SUM=$(awk -v file="$UPDATER" '$2 == file && $1 ~ /^[0-9a-f]+$/ && length($1) == 
 [[ "$SUM" =~ ^[0-9a-f]{64}$ ]] || fail 'Missing or ambiguous assistant checksum'
 (cd "$STAGE"; printf '%s  %s\n' "$SUM" "$UPDATER" | sha256sum -c - >/dev/null) || fail 'Assistant checksum mismatch; nothing was installed'
 chmod 755 "$STAGE/$UPDATER"
-if [ "$UPGRADE" -eq 1 ]; then
+if [ "$UPGRADE" -eq 1 ] && [ "$REFRESH" -eq 0 ]; then
   [ -n "$PANEL" ] || PANEL=$("$STAGE/$UPDATER" binding --root "$ROOT" --field panel) || fail 'Cannot resolve saved panel binding'
   [ -n "$MACHINE" ] || MACHINE=$("$STAGE/$UPDATER" binding --root "$ROOT" --field machine) || fail 'Cannot resolve saved machine binding'
   [ -n "$TOKEN" ] || TOKEN=$("$STAGE/$UPDATER" binding --root "$ROOT" --field token) || fail 'Cannot resolve saved machine credential'
 fi
+if [ "$REFRESH" -eq 0 ]; then
 [[ "$PANEL" =~ ^https://[^/@[:space:]\?#]+(:[0-9]+)?(/[^[:space:]\?#]*)?$ ]] || fail 'A valid HTTPS panel URL is required'
 [[ "$MACHINE" =~ ^[1-9][0-9]*$ ]] || fail 'A positive machine ID is required'
 [ -n "$TOKEN" ] || fail 'A machine token is required'
+fi
 
 install_updater() {
   # Core replacement and health/rollback have completed. Explicitly unlock
   # before launching the daemon; OpenRC children may inherit descriptor 9.
-  if [ "${LOCKED:-0}" -eq 1 ]; then flock -u 9; exec 9>&-; LOCKED=0; fi
   # Updating the helper is independent from caddy, and requires no credentials
   # in service arguments or shell environment files.
   local candidate
@@ -149,7 +158,7 @@ install_updater() {
   install -m 755 "$STAGE/$UPDATER" "$candidate"
   mv -f "$candidate" /usr/local/bin/caddy-updater
   if [ "$MANAGER" = systemd ]; then
-    cat > /etc/systemd/system/caddy-updater.service <<'UNIT'
+    cat > "$STAGE/updater.service" <<'UNIT'
 [Unit]
 Description=Onenew Native Upgrade Assistant
 After=network-online.target
@@ -163,12 +172,16 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 UNIT
+    candidate=$(mktemp /etc/systemd/system/.caddy-updater.XXXXXXXX)
+    install -m 644 "$STAGE/updater.service" "$candidate"
+    mv -f "$candidate" /etc/systemd/system/caddy-updater.service
     systemctl daemon-reload
     systemctl enable caddy-updater.service
-    systemctl restart caddy-updater.service
+    release_assistant_lock
+    systemctl restart caddy-updater.service 8>&-
     systemctl is-active --quiet caddy-updater.service || fail 'Upgrade assistant failed to start'
   else
-    cat > /etc/init.d/caddy-updater <<'UNIT'
+    cat > "$STAGE/updater.service" <<'UNIT'
 #!/sbin/openrc-run
 description="Onenew Native Upgrade Assistant"
 command="/usr/local/bin/caddy-updater"
@@ -180,12 +193,96 @@ output_log="/var/log/caddy-updater.log"
 error_log="/var/log/caddy-updater.err"
 depend() { need net; }
 UNIT
-    chmod 755 /etc/init.d/caddy-updater
+    candidate=$(mktemp /etc/init.d/.caddy-updater.XXXXXXXX)
+    install -m 755 "$STAGE/updater.service" "$candidate"
+    mv -f "$candidate" /etc/init.d/caddy-updater
     rc-update add caddy-updater default
-    rc-service caddy-updater restart
+    release_assistant_lock
+    rc-service caddy-updater restart 8>&-
     rc-service caddy-updater status >/dev/null || fail 'Upgrade assistant failed to start'
   fi
 }
+release_assistant_lock() {
+  if [ "${LOCKED:-0}" -eq 1 ]; then flock -u 9; exec 9>&-; LOCKED=0; fi
+}
+if [ "$REFRESH" -eq 1 ]; then
+  [ "$CHECK" -eq 0 ] || fail 'Assistant refresh cannot be combined with check-only'
+  [ -f /usr/local/bin/caddy-updater ] && [ ! -L /usr/local/bin/caddy-updater ] || fail 'Assistant refresh requires an existing regular helper'
+  if [ "$MANAGER" = systemd ]; then
+    UNIT=/etc/systemd/system/caddy-updater.service
+    [ ! -e /etc/init.d/caddy-updater ] && [ ! -L /etc/init.d/caddy-updater ] || fail 'Conflicting assistant service'
+    [ -f "$UNIT" ] && [ ! -L "$UNIT" ] || fail 'Native assistant service missing'
+    assistant_property() { systemctl show "--property=$1" --value caddy-updater.service; }
+    [ "$(assistant_property Description)" = 'Onenew Native Upgrade Assistant' ] &&
+      [ "$(assistant_property FragmentPath)" = "$UNIT" ] || fail 'Unknown assistant service'
+    ASSISTANT_EXEC=$(assistant_property ExecStart)
+    [[ "$ASSISTANT_EXEC" == '{ path=/usr/local/bin/caddy-updater ; argv[]=/usr/local/bin/caddy-updater run --root /etc/caddy --manager systemd ; ignore_errors=no ;'* ]] &&
+      [ "$(printf '%s' "$ASSISTANT_EXEC" | grep -o 'argv\[\]=' | wc -l)" -eq 1 ] || fail 'Unknown assistant execution command'
+    ASSISTANT_DROPINS=$(assistant_property DropInPaths)
+    { [ -z "$ASSISTANT_DROPINS" ] || [ "$ASSISTANT_DROPINS" = /run/systemd/system/service.d/zzz-lxc-service.conf ]; } || fail 'Custom assistant service overrides are not supported'
+    for property_name in Environment EnvironmentFiles ExecStartPre ExecStartPost ExecStop ExecStopPost ExecReload; do
+      [ -z "$(assistant_property "$property_name")" ] || fail 'Custom assistant service overrides are not supported'
+    done
+    assistant_stop() { systemctl stop caddy-updater.service 8>&-; }
+    assistant_start() { systemctl restart caddy-updater.service 8>&-; }
+  else
+    UNIT=/etc/init.d/caddy-updater
+    [ ! -e /etc/systemd/system/caddy-updater.service ] && [ ! -L /etc/systemd/system/caddy-updater.service ] || fail 'Conflicting assistant service'
+    [ -f "$UNIT" ] && [ ! -L "$UNIT" ] && [ -x "$UNIT" ] || fail 'Native assistant service missing'
+    grep -Fxq 'description="Onenew Native Upgrade Assistant"' "$UNIT" &&
+      grep -Fxq 'command="/usr/local/bin/caddy-updater"' "$UNIT" &&
+      grep -Fxq 'command_args="run --root /etc/caddy --manager openrc"' "$UNIT" &&
+      grep -Fxq 'supervisor="supervise-daemon"' "$UNIT" || fail 'Unknown assistant service'
+    assistant_stop() { rc-service caddy-updater stop 8>&-; }
+    assistant_start() { rc-service caddy-updater restart 8>&-; }
+  fi
+  { [ ! -e "$ROOT/updater/journal.json" ] && [ ! -L "$ROOT/updater/journal.json" ]; } || fail 'Assistant has a recovery/result journal; resolve the task first'
+  # Resolve only non-secret saved identity using the verified candidate.
+  "$STAGE/$UPDATER" binding --root "$ROOT" --field panel >/dev/null || fail 'Cannot resolve saved panel binding'
+  "$STAGE/$UPDATER" binding --root "$ROOT" --field machine >/dev/null || fail 'Cannot resolve saved machine binding'
+  cp -p /usr/local/bin/caddy-updater "$STAGE/assistant.previous"
+  cp -p "$UNIT" "$STAGE/unit.previous"
+  refresh_cleanup() {
+    local status=$? restore_failed=0 candidate
+    trap - EXIT INT TERM
+    set +e
+    if [ "${REFRESH_STOPPED:-0}" -eq 1 ] && [ "${REFRESH_DONE:-0}" -eq 0 ]; then
+      if [ "${REFRESH_REPLACED:-0}" -eq 1 ]; then
+        assistant_stop >/dev/null 2>&1
+        candidate=$(mktemp /usr/local/bin/.caddy-updater.XXXXXXXX)
+        { install -m 755 "$STAGE/assistant.previous" "$candidate" &&
+          mv -f "$candidate" /usr/local/bin/caddy-updater; } || restore_failed=1
+        candidate=$(mktemp "${UNIT%/*}/.caddy-updater.XXXXXXXX")
+        { cp -p "$STAGE/unit.previous" "$candidate" &&
+          mv -f "$candidate" "$UNIT"; } || restore_failed=1
+        if [ "$MANAGER" = systemd ]; then systemctl daemon-reload; fi
+      fi
+      release_assistant_lock
+      assistant_start || printf 'ERROR: Previous assistant could not restart; inspect its service logs.\n' >&2
+    fi
+    release_assistant_lock
+    if [ "$restore_failed" -eq 0 ]; then rm -rf -- "$STAGE"
+    else printf 'ERROR: Assistant restoration incomplete; recovery files retained at %s\n' "$STAGE" >&2; fi
+    flock -u 8 >/dev/null 2>&1 || true
+    exec 8>&-
+    exit "$status"
+  }
+  trap refresh_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  REFRESH_STOPPED=1
+  assistant_stop
+  exec 9>"$ROOT/updater.lock"
+  flock -n 9 || fail 'Another installer holds the upgrade lock; assistant refresh refused'
+  LOCKED=1
+  [ ! -L "$ROOT/updater" ] || fail 'Assistant state directory is a symlink'
+  { [ ! -e "$ROOT/updater/journal.json" ] && [ ! -L "$ROOT/updater/journal.json" ]; } || fail 'Assistant has a recovery/result journal; restarting the previous assistant: resolve the task first'
+  REFRESH_REPLACED=1
+  install_updater
+  REFRESH_DONE=1
+  printf 'Refreshed upgrade assistant; node service and saved configuration preserved.\n'
+  exit 0
+fi
 PACKAGE="onenew-node-linux-$ARCH.tar.gz"
 curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/$PACKAGE" -o "$STAGE/$PACKAGE"
 curl --proto '=https' --tlsv1.2 -fsSL --retry 2 "$BASE/SHA256SUMS-$ARCH" -o "$STAGE/SHA256SUMS"
@@ -233,7 +330,7 @@ if [ "$UPGRADE" -eq 1 ]; then
     if [ "$MANAGER" = systemd ]; then systemctl stop caddy.service; else rc-service caddy stop; fi
   }
   manager_start() {
-    if [ "$MANAGER" = systemd ]; then systemctl start caddy.service; else rc-service caddy start; fi
+    if [ "$MANAGER" = systemd ]; then systemctl start caddy.service 8>&- 9>&-; else rc-service caddy start 8>&- 9>&-; fi
   }
   rollback_upgrade() {
     local reason="${1:-unexpected failure}"
