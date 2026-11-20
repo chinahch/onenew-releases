@@ -2,8 +2,8 @@
 # Native binary installation; no Docker is used on the node server.
 set -Eeuo pipefail
 umask 077
-VERSION=onenew-v0.1.16
-RELEASE=node-v0.1.16
+VERSION=onenew-v0.1.17
+RELEASE=node-v0.1.17
 BASE="https://get.timi.baby/releases/$RELEASE"
 ROOT=/etc/caddy
 PANEL= TOKEN= MACHINE= CHECK=0 UPGRADE=0 REFRESH=0
